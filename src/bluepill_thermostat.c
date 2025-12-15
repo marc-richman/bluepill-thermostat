@@ -854,14 +854,17 @@ static bool sht40_read_temperature_centi(int32_t *temp_centi)
          */
         uint32_t tstart = millis();
         bool got_good = false;
+        uint32_t crc_fail_count = 0;
+        uint32_t read_attempts = 0;
 
         while ((millis() - tstart) < SHT40_MEAS_DELAY_MS) {
             /* Attempt to read 6 bytes */
             i2c_transfer7(SHT40_I2C, SHT40_ADDR, NULL, 0, buf, sizeof(buf));
+            read_attempts++;
 
             /* Validate CRC for both temperature and humidity words.
              * If CRC matches, parse and return success.
-             * If CRC fails, do a short backoff and try reading again until timeout.
+             * If CRC fails, note it and try again until timeout.
              */
             if ((sht40_crc8(&buf[0], 2) == buf[2]) &&
                 (sht40_crc8(&buf[3], 2) == buf[5])) {
@@ -884,13 +887,27 @@ static bool sht40_read_temperature_centi(int32_t *temp_centi)
                 return true;
             }
 
+            crc_fail_count++;
+            if (usb_configured) {
+                char msg[64];
+                snprintf(msg, sizeof(msg), "SHT40 CRC failed (attempt %lu)\r\n", (unsigned long)read_attempts);
+                usb_write_str(msg);
+            }
+
             /* short pause & keep USB/WDT alive */
             delay_ms(SHT40_I2C_RETRY_DELAY_MS);
         }
 
         /* If we get here, this attempt timed out without a valid frame.
-         * Try a soft reset of I2C and reconfigure before next attempt.
+         * Print a timeout message and try a soft reset of I2C and reconfigure before next attempt.
          */
+        if (usb_configured) {
+            char msg[80];
+            snprintf(msg, sizeof(msg), "SHT40 read timeout after %lu ms (crc failures=%lu), performing I2C soft-reset (attempt %u)\r\n",
+                     (unsigned long)SHT40_MEAS_DELAY_MS, (unsigned long)crc_fail_count, attempt + 1);
+            usb_write_str(msg);
+        }
+
         iwdg_reset();
         i2c1_soft_reset(SHT40_I2C);
         i2c_setup();
@@ -898,6 +915,9 @@ static bool sht40_read_temperature_centi(int32_t *temp_centi)
     }
 
     /* All attempts failed */
+    if (usb_configured) {
+        usb_write_str("SHT40 read failed after multiple attempts\r\n");
+    }
     return false;
 }
 
