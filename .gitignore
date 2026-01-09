@@ -3,3 +3,13 @@ bin/
 *.bin
 generated.*.ld
 libopencm3/*
+
+# ===== Emacs =====
+*~
+\#*\#
+.\#*
+\.emacs.desktop
+\.emacs.desktop.lock
+*.elc
+auto-save-list/
+tramp
