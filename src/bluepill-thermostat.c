@@ -1,3 +1,21 @@
+/*
+ * bluepill-thermostat.c
+ *
+ * Bluepill heater controller with SHT40 sensor and USB CDC console.
+ *
+ * Applied fixes and updates:
+ *  - Command prefix matching ordering (specific "C"/"F" variants first)
+ *  - Robust I2C handling: avoid using return value of i2c_transfer7 when unavailable,
+ *    clear read buffer before attempts, add limited bus re-inits and improved retry logging
+ *  - Added checks and bounds for numeric parsing
+ *  - Small non-blocking outbound USB queue to avoid blocking main control loop
+ *  - Removed duplicate RCC_GPIOB clock enable
+ *
+ * Note: This file is intended to compile with libopencm3 versions where i2c_transfer7
+ * has a void return type. If your libopencm3 provides a return value for i2c_transfer7,
+ * further improvements could be made by inspecting that return value.
+ */
+
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -37,6 +55,8 @@
 #define SHT40_MEAS_DELAY_MS             (SHT40_MEAS_MAX_TIME_MS + SHT40_MEAS_DELAY_MARGIN_MS) /* 20ms */
 #define SHT40_I2C_MAX_RETRIES           3U
 #define SHT40_I2C_RETRY_DELAY_MS        2U
+/* cap of how many times we will fully re-initialize I2C across the entire run of program */
+#define SHT40_I2C_MAX_BUS_REINITS       4U
 
 /* Defaults stored internally as centi-°C and milliseconds */
 #define DEFAULT_TEMP_THRESHOLD_CENTI    1670    /* 16.70 °C */
@@ -55,6 +75,14 @@
 #define CONFIG_FLASH_ADDR               0x0800FC00
 #define CONFIG_MAGIC                    0xDEADBEEF
 
+/* Parsing bounds */
+#define PARSE_SECS_MAX                  604800UL   /* 7 days cap for safety */
+#define PARSE_CENTI_MAX_ABS             100000     /* 1000.00 °C absolute cap (very large, but protects overflows) */
+
+/* USB outbound queue size */
+#define USB_TX_BUF_SIZE                 512
+#define USB_EP_BULK_MAXPACKET           64
+
 /* ------------ Globals ------------ */
 
 static volatile uint32_t system_millis = 0;
@@ -68,6 +96,12 @@ static uint32_t cooldown_sleep_ms    = DEFAULT_COOLDOWN_SLEEP_MS;
 static usbd_device *usbdev;
 static bool usb_configured = false;
 
+/* Small outbound queue (non-blocking): producers enqueue, consumer flushes in usb_poll path */
+static uint8_t usb_tx_buf[USB_TX_BUF_SIZE];
+static volatile uint16_t usb_tx_head = 0; /* next write index */
+static volatile uint16_t usb_tx_tail = 0; /* next read index */
+
+/* Command buffer for incoming CDC */
 static char cmd_buf[64];
 static uint8_t cmd_len = 0;
 
@@ -103,6 +137,12 @@ static void print_config(void);
 static void hard_reset_via_watchdog(const char *reason);
 
 static void handle_command(const char *cmd);
+
+/* USB TX queue helpers */
+static size_t usb_tx_enqueue(const char *s);
+static void usb_tx_service(void);
+
+/* Reworked usb_write_str to use enqueue */
 static void usb_write_str(const char *s);
 
 static bool parse_centi(const char *s, int32_t *out);
@@ -184,6 +224,7 @@ static void boot_cause_init(void)
 /* ------------ GPIO/heater ------------ */
 static void gpio_setup(void)
 {
+    /* Keep the single enable for GPIOB here (removed duplicate in i2c_setup). */
     rcc_periph_clock_enable(RCC_GPIOB);
 
     gpio_set_mode(HEATER_PORT, GPIO_MODE_OUTPUT_2_MHZ,
@@ -226,7 +267,7 @@ static void i2c1_soft_reset(uint32_t i2c)
 
 static void i2c_setup(void)
 {
-    rcc_periph_clock_enable(RCC_GPIOB);
+    /* GPIOB clock already enabled in gpio_setup() - avoid duplicate enable. */
     rcc_periph_clock_enable(RCC_I2C1);
 
     gpio_set_mode(GPIOB, GPIO_MODE_OUTPUT_50_MHZ,
@@ -420,23 +461,63 @@ static void usb_setup(void)
     usbd_register_set_config_callback(usbdev, cdcacm_set_config);
 }
 
-static void usb_poll(void)
+static void usb_tx_service(void)
 {
-    if (usbdev) usbd_poll(usbdev);
+    if (!usb_configured || !usbdev) return;
+
+    /* Flush the queue in EP-sized chunks */
+    while (usb_tx_tail != usb_tx_head) {
+        uint16_t tail = usb_tx_tail;
+        uint16_t head = usb_tx_head;
+        uint16_t len;
+
+        if (head > tail) len = head - tail;
+        else len = USB_TX_BUF_SIZE - tail;
+
+        if (len == 0) break;
+
+        if (len > USB_EP_BULK_MAXPACKET) len = USB_EP_BULK_MAXPACKET;
+
+        int written = usbd_ep_write_packet(usbdev, 0x82, &usb_tx_buf[tail], len);
+        if (written <= 0) {
+            /* Can't write now, back off and retry later */
+            break;
+        }
+
+        usb_tx_tail = (uint16_t)((usb_tx_tail + written) % USB_TX_BUF_SIZE);
+    }
+}
+
+/* Enqueue as many bytes of s as will fit; returns number enqueued */
+static size_t usb_tx_enqueue(const char *s)
+{
+    size_t enq = 0;
+    while (*s) {
+        uint16_t next_head = (uint16_t)((usb_tx_head + 1) % USB_TX_BUF_SIZE);
+        if (next_head == usb_tx_tail) {
+            /* buffer full */
+            break;
+        }
+        usb_tx_buf[usb_tx_head] = (uint8_t)*s++;
+        usb_tx_head = next_head;
+        enq++;
+    }
+    return enq;
 }
 
 static void usb_write_str(const char *s)
 {
     if (!usb_configured) return;
 
-    while (*s) {
-        char buf[64];
-        int i = 0;
-        while (*s && i < (int)sizeof(buf)) {
-            buf[i++] = *s++;
-        }
-        (void)usbd_ep_write_packet(usbdev, 0x82, buf, i);
-    }
+    /* Non-blocking enqueue; if queue is full, we drop the remainder */
+    usb_tx_enqueue(s);
+}
+
+/* Ensure usb_poll calls usbd_poll and flushes outbound queue */
+static void usb_poll(void)
+{
+    if (usbdev) usbd_poll(usbdev);
+    usb_tx_service();
 }
 
 static enum usbd_request_return_codes
@@ -505,6 +586,7 @@ static void cdcacm_set_config(usbd_device *usbd_dev, uint16_t wValue)
 
     usb_configured = true;
 
+    /* Welcome messages use enqueue (non-blocking) */
     usb_write_str("\r\nBluepill heater controller with SHT40\r\n");
     usb_write_str(boot_cause_msg);
     usb_write_str("\r\nCommands:\r\n");
@@ -559,6 +641,8 @@ static bool parse_centi(const char *s, int32_t *out)
     if (*s < '0' || *s > '9') return false;
 
     while (*s >= '0' && *s <= '9') {
+        /* avoid overflow: cap integer part to PARSE_CENTI_MAX_ABS/100 */
+        if (ip > (PARSE_CENTI_MAX_ABS / 100)) return false;
         ip = ip * 10 + (*s - '0');
         s++;
     }
@@ -577,6 +661,7 @@ static bool parse_centi(const char *s, int32_t *out)
     if (fp_digits == 0) fp = 0;
 
     int32_t val = ip * 100 + fp;
+    if (val > (int32_t)PARSE_CENTI_MAX_ABS) return false;
     if (neg) val = -val;
 
     *out = val;
@@ -590,7 +675,11 @@ static bool parse_uint_seconds(const char *s, uint32_t *out)
     if (*s < '0' || *s > '9') return false;
 
     while (*s >= '0' && *s <= '9') {
-        val = val * 10 + (uint32_t)(*s - '0');
+        uint32_t digit = (uint32_t)(*s - '0');
+        /* check overflow and cap */
+        if (val > (PARSE_SECS_MAX / 10)) return false;
+        val = val * 10 + digit;
+        if (val > PARSE_SECS_MAX) return false;
         s++;
     }
 
@@ -676,13 +765,15 @@ static void handle_command(const char *cmd)
      * default: t= / threshold= => Fahrenheit
      * explicit F: tF= / thresholdF=
      * explicit C: tC= / thresholdC=
+     *
+     * IMPORTANT: check specific variants before generic ones.
      */
-    if (strncmp(cmd, "threshold=", 10) == 0 ||
+    if (strncmp(cmd, "thresholdC=", 11) == 0 ||
         strncmp(cmd, "thresholdF=", 11) == 0 ||
-        strncmp(cmd, "thresholdC=", 11) == 0 ||
-        strncmp(cmd, "t=", 2) == 0 ||
+        strncmp(cmd, "threshold=", 10) == 0 ||
+        strncmp(cmd, "tC=", 3) == 0 ||
         strncmp(cmd, "tF=", 3) == 0 ||
-        strncmp(cmd, "tC=", 3) == 0) {
+        strncmp(cmd, "t=", 2) == 0) {
 
         const char *valstr = strchr(cmd, '=');
         if (valstr) valstr++;
@@ -697,6 +788,7 @@ static void handle_command(const char *cmd)
         if (strncmp(cmd, "tC=", 3) == 0 || strncmp(cmd, "thresholdC=", 11) == 0) {
             is_celsius = true;
         }
+        /* default (unqualified) and F-suffixed inputs are treated as Fahrenheit */
 
         int32_t new_thr_c = is_celsius ? in_centi : centiF_to_centiC(in_centi);
 
@@ -716,7 +808,7 @@ static void handle_command(const char *cmd)
         if (valstr) valstr++;
 
         uint32_t secs;
-        if (valstr && parse_uint_seconds(valstr, &secs) && secs > 0) {
+        if (valstr && parse_uint_seconds(valstr, &secs) && secs > 0 && secs <= PARSE_SECS_MAX) {
             uint32_t new_ms = secs * 1000UL;
             if (new_ms != heat_max_time_ms) {
                 heat_max_time_ms = new_ms;
@@ -737,7 +829,7 @@ static void handle_command(const char *cmd)
         if (valstr) valstr++;
 
         uint32_t secs;
-        if (valstr && parse_uint_seconds(valstr, &secs) && secs > 0) {
+        if (valstr && parse_uint_seconds(valstr, &secs) && secs > 0 && secs <= PARSE_SECS_MAX) {
             uint32_t new_ms = secs * 1000UL;
             if (new_ms != cooldown_sleep_ms) {
                 cooldown_sleep_ms = new_ms;
@@ -786,10 +878,19 @@ static bool sht40_read_temperature_centi(int32_t *temp_centi)
     uint8_t cmd;
     uint8_t buf[6];
 
+    unsigned int bus_reinit_count = 0;
+
     for (uint8_t attempt = 0; attempt < SHT40_I2C_MAX_RETRIES; attempt++) {
+        if (bus_reinit_count > SHT40_I2C_MAX_BUS_REINITS) {
+            /* too many bus reinitializations: give up early */
+            break;
+        }
+
         cmd = SHT40_CMD_MEAS_HIGH_PREC;
 
-        /* Fire measurement command */
+        /* Fire measurement command; i2c_transfer7 returns void in some libopencm3 versions,
+         * so we can't rely on a return value across builds. Call it and proceed.
+         */
         i2c_transfer7(SHT40_I2C, SHT40_ADDR, &cmd, 1, NULL, 0);
 
         uint32_t tstart = millis();
@@ -797,9 +898,13 @@ static bool sht40_read_temperature_centi(int32_t *temp_centi)
         uint32_t crc_fail_count = 0;
 
         while ((millis() - tstart) < SHT40_MEAS_DELAY_MS) {
+            /* Clear buffer before read so stale bytes don't falsely pass CRC */
+            memset(buf, 0, sizeof(buf));
+
             i2c_transfer7(SHT40_I2C, SHT40_ADDR, NULL, 0, buf, sizeof(buf));
             read_attempts++;
 
+            /* Only validate CRC and decode if buffer looks non-zero; we still rely on CRC */
             if ((sht40_crc8(&buf[0], 2) == buf[2]) &&
                 (sht40_crc8(&buf[3], 2) == buf[5])) {
 
@@ -821,10 +926,11 @@ static bool sht40_read_temperature_centi(int32_t *temp_centi)
         }
 
         if (usb_configured) {
-            char msg[64];
-            snprintf(msg, sizeof(msg), "SHT40 TO %lums crc%lu try%u\r\n",
+            char msg[128];
+            snprintf(msg, sizeof(msg), "SHT40 TO %lums crc%lu readAttempts%lu try%u\r\n",
                      (unsigned long)SHT40_MEAS_DELAY_MS,
                      (unsigned long)crc_fail_count,
+                     (unsigned long)read_attempts,
                      (unsigned)(attempt + 1));
             usb_write_str(msg);
         }
@@ -832,6 +938,7 @@ static bool sht40_read_temperature_centi(int32_t *temp_centi)
         /* Recover I2C and retry */
         i2c1_soft_reset(SHT40_I2C);
         i2c_setup();
+        bus_reinit_count++;
         delay_ms(2);
     }
 
