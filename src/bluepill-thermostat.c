@@ -3,17 +3,26 @@
  *
  * Bluepill heater controller with SHT40 sensor and USB CDC console.
  *
- * Applied fixes and updates:
- *  - Command prefix matching ordering (specific "C"/"F" variants first)
- *  - Robust I2C handling: avoid using return value of i2c_transfer7 when unavailable,
- *    clear read buffer before attempts, add limited bus re-inits and improved retry logging
- *  - Added checks and bounds for numeric parsing
- *  - Small non-blocking outbound USB queue to avoid blocking main control loop
- *  - Removed duplicate RCC_GPIOB clock enable
+ * Rewritten to use libopencm3 low-level I2C helpers (for STM32F103):
+ *  - i2c_send_start
+ *  - i2c_send_7bit_address
+ *  - i2c_send_stop
  *
- * Note: This file is intended to compile with libopencm3 versions where i2c_transfer7
- * has a void return type. If your libopencm3 provides a return value for i2c_transfer7,
- * further improvements could be made by inspecting that return value.
+ * Uses register-level checks (I2C_SR1/I2C_SR2/I2C_DR) for robust error reporting
+ * and replaces prior use of i2c_transfer7. Intended for libopencm3 + STM32F1.
+ *
+ * Retains improvements:
+ *  - Command prefix ordering fixes
+ *  - USB non-blocking outbound queue
+ *  - Parsing bounds for seconds/temperature
+ *  - Single GPIOB RCC enable
+ *  - I2C bus re-init limiting and improved retry logging
+ *
+ * Note: STM32F1 I2C read semantics for the last 1-2 bytes are delicate. This
+ * implementation takes a pragmatic approach: it issues STOP before the final
+ * RXNE read to force the peripheral to NACK further bytes. For absolute
+ * corner-case correctness on all toolchain versions, further device-specific
+ * handling of ACK/POS may be required.
  */
 
 #include <stdint.h>
@@ -77,11 +86,31 @@
 
 /* Parsing bounds */
 #define PARSE_SECS_MAX                  604800UL   /* 7 days cap for safety */
-#define PARSE_CENTI_MAX_ABS             100000     /* 1000.00 °C absolute cap (very large, but protects overflows) */
+#define PARSE_CENTI_MAX_ABS             100000     /* 1000.00 °C absolute cap */
 
 /* USB outbound queue size */
 #define USB_TX_BUF_SIZE                 512
 #define USB_EP_BULK_MAXPACKET           64
+
+/* I2C helper timeouts */
+#define I2C_FLAG_TIMEOUT_MS             5U   /* per-flag small timeout for responsiveness */
+#define I2C_BYTE_TIMEOUT_MS             5U
+
+/* Local SR1 bit masks (explicit values for STM32F1) */
+#define I2C_SR1_SB_MASK      (1U << 0)
+#define I2C_SR1_ADDR_MASK    (1U << 1)
+#define I2C_SR1_BTF_MASK     (1U << 2)
+#define I2C_SR1_ADD10_MASK   (1U << 3)
+#define I2C_SR1_STOPF_MASK   (1U << 4)
+#define I2C_SR1_RXNE_MASK    (1U << 6)
+#define I2C_SR1_TXE_MASK     (1U << 7)
+#define I2C_SR1_BERR_MASK    (1U << 8)
+#define I2C_SR1_ARLO_MASK    (1U << 9)
+#define I2C_SR1_AF_MASK      (1U << 10)
+#define I2C_SR1_OVR_MASK     (1U << 11)
+#define I2C_SR1_PECERR_MASK  (1U << 12)
+#define I2C_SR1_TIMEOUT_MASK (1U << 14)
+#define I2C_SR1_SMBALERT_MASK (1U << 15)
 
 /* ------------ Globals ------------ */
 
@@ -153,6 +182,10 @@ static int32_t centiC_to_centiF(int32_t cC);
 static int32_t centiF_to_centiC(int32_t cF);
 
 static void i2c1_soft_reset(uint32_t i2c);
+static int i2c_write_bytes(uint32_t i2c, uint8_t addr, const uint8_t *data, size_t len,
+                           uint32_t timeout_ms, char *err, size_t errlen);
+static int i2c_read_bytes(uint32_t i2c, uint8_t addr, uint8_t *buf, size_t len,
+                          uint32_t timeout_ms, char *err, size_t errlen);
 static bool sht40_read_temperature_centi(int32_t *temp_centi);
 
 typedef enum {
@@ -253,7 +286,153 @@ static void hard_reset_via_watchdog(const char *reason)
     }
 }
 
-/* ------------ I2C ------------ */
+/* ------------ I2C low-level helpers (register-based) ------------ */
+
+/* wait for a SR1 bit mask to be set, returns true if set before timeout_ms, false otherwise */
+static bool i2c_wait_flag(uint32_t i2c, uint32_t sr1_mask, uint32_t timeout_ms)
+{
+    uint32_t start = millis();
+    while (!(I2C_SR1(i2c) & sr1_mask)) {
+        uint32_t sr1 = I2C_SR1(i2c);
+        /* check for fatal errors: bus error, arbitration lost, ack failure */
+        if (sr1 & (I2C_SR1_BERR_MASK | I2C_SR1_ARLO_MASK | I2C_SR1_AF_MASK)) {
+            return false;
+        }
+        if ((millis() - start) >= timeout_ms) return false;
+        usb_poll(); /* keep USB alive while waiting */
+    }
+    return true;
+}
+
+/* Write len bytes to 'addr' (7-bit) on bus 'i2c'.
+ * Returns 0 on success, negative on error.
+ * err (optional) will be populated with an ASCII brief message.
+ */
+static int i2c_write_bytes(uint32_t i2c, uint8_t addr, const uint8_t *data, size_t len,
+                           uint32_t timeout_ms, char *err, size_t errlen)
+{
+    /* Send START */
+    i2c_send_start(i2c);
+    if (!i2c_wait_flag(i2c, I2C_SR1_SB_MASK, timeout_ms)) {
+        if (err) snprintf(err, errlen, "START_TO");
+        goto err_no_stop;
+    }
+
+    /* Send address (write) */
+    i2c_send_7bit_address(i2c, addr, I2C_WRITE);
+    if (!i2c_wait_flag(i2c, I2C_SR1_ADDR_MASK, timeout_ms)) {
+        /* NACK or timeout */
+        if (I2C_SR1(i2c) & I2C_SR1_AF_MASK) {
+            if (err) snprintf(err, errlen, "ADDR_NACK");
+            i2c_send_stop(i2c);
+            return -2;
+        }
+        if (err) snprintf(err, errlen, "ADDR_TO");
+        i2c_send_stop(i2c);
+        return -1;
+    }
+    /* Clear ADDR by reading SR1 then SR2 */
+    (void)I2C_SR1(i2c);
+    (void)I2C_SR2(i2c);
+
+    /* Send bytes */
+    for (size_t i = 0; i < len; i++) {
+        I2C_DR(i2c) = data[i];
+        /* Wait for TXE (data register empty) */
+        if (!i2c_wait_flag(i2c, I2C_SR1_TXE_MASK, timeout_ms)) {
+            if (I2C_SR1(i2c) & I2C_SR1_AF_MASK) {
+                if (err) snprintf(err, errlen, "DATA_NACK");
+                i2c_send_stop(i2c);
+                return -2;
+            }
+            if (err) snprintf(err, errlen, "DATA_TO");
+            i2c_send_stop(i2c);
+            return -1;
+        }
+    }
+
+    /* Wait for BTF if available (transfer finished) */
+    i2c_wait_flag(i2c, I2C_SR1_BTF_MASK, timeout_ms);
+
+    i2c_send_stop(i2c);
+    return 0;
+
+err_no_stop:
+    /* best-effort stop */
+    i2c_send_stop(i2c);
+    return -1;
+}
+
+/* Read len bytes from 'addr' (7-bit) on bus 'i2c'.
+ * Returns 0 on success, negative on error.
+ * err (optional) will be populated with an ASCII brief message.
+ *
+ * Note: For STM32F1, proper handling of 1/2 byte reads can require special ACK/POS handling.
+ * This implementation issues STOP before reading the final byte to force the peripheral to send NACK.
+ */
+static int i2c_read_bytes(uint32_t i2c, uint8_t addr, uint8_t *buf, size_t len,
+                          uint32_t timeout_ms, char *err, size_t errlen)
+{
+    if (len == 0) return 0;
+
+    /* Ensure ACK is enabled initially */
+    I2C_CR1(i2c) |= I2C_CR1_ACK;
+
+    i2c_send_start(i2c);
+    if (!i2c_wait_flag(i2c, I2C_SR1_SB_MASK, timeout_ms)) {
+        if (err) snprintf(err, errlen, "START_TO");
+        goto rd_err_no_stop;
+    }
+
+    i2c_send_7bit_address(i2c, addr, I2C_READ);
+    if (!i2c_wait_flag(i2c, I2C_SR1_ADDR_MASK, timeout_ms)) {
+        if (I2C_SR1(i2c) & I2C_SR1_AF_MASK) {
+            if (err) snprintf(err, errlen, "ADDR_NACK");
+            i2c_send_stop(i2c);
+            return -2;
+        }
+        if (err) snprintf(err, errlen, "ADDR_TO");
+        i2c_send_stop(i2c);
+        return -1;
+    }
+
+    /* Clear ADDR by reading SR1 then SR2 */
+    (void)I2C_SR1(i2c);
+    (void)I2C_SR2(i2c);
+
+    for (size_t i = 0; i < len; i++) {
+        /* For the last byte, prepare to NACK and STOP */
+        if (i == (len - 1)) {
+            /* Disable ACK so the controller NACKs the final byte */
+            I2C_CR1(i2c) &= ~I2C_CR1_ACK;
+            /* Send STOP early to ensure the peripheral releases the bus after last byte */
+            i2c_send_stop(i2c);
+        }
+
+        /* Wait for RXNE */
+        if (!i2c_wait_flag(i2c, I2C_SR1_RXNE_MASK, timeout_ms)) {
+            uint32_t sr1 = I2C_SR1(i2c);
+            if (sr1 & (I2C_SR1_BERR_MASK | I2C_SR1_ARLO_MASK)) {
+                if (err) snprintf(err, errlen, "BUS_ERR");
+                return -3;
+            }
+            if (err) snprintf(err, errlen, "RXNE_TO");
+            return -1;
+        }
+        /* Read data register */
+        buf[i] = (uint8_t)I2C_DR(i2c);
+    }
+
+    /* Re-enable ACK for future ops */
+    I2C_CR1(i2c) |= I2C_CR1_ACK;
+
+    return 0;
+
+rd_err_no_stop:
+    i2c_send_stop(i2c);
+    return -1;
+}
+
 static void i2c1_soft_reset(uint32_t i2c)
 {
     i2c_peripheral_disable(i2c);
@@ -280,6 +459,9 @@ static void i2c_setup(void)
     i2c_set_standard_mode(SHT40_I2C);
     i2c_set_ccr(SHT40_I2C, I2C_CCR_SM_100KHZ_36MHZ);
     i2c_set_trise(SHT40_I2C, I2C_TRISE_SM_36MHZ);
+
+    /* Enable ACK by default */
+    I2C_CR1(SHT40_I2C) |= I2C_CR1_ACK;
 
     i2c_peripheral_enable(SHT40_I2C);
 }
@@ -604,9 +786,11 @@ static void cdcacm_set_config(usbd_device *usbd_dev, uint16_t wValue)
 static void centi_to_str(int32_t centi, char *buf, size_t len)
 {
     bool neg = false;
-    if (centi < 0) { neg = true; centi = -centi; }
-    int32_t ip = centi / 100;
-    int32_t fp = centi % 100;
+    /* guard INT32_MIN by using int64_t */
+    int64_t val = centi;
+    if (val < 0) { neg = true; val = -val; }
+    int32_t ip = (int32_t)(val / 100);
+    int32_t fp = (int32_t)(val % 100);
 
     snprintf(buf, len, "%s%ld.%02ld", neg ? "-" : "", (long)ip, (long)fp);
 }
@@ -888,46 +1072,65 @@ static bool sht40_read_temperature_centi(int32_t *temp_centi)
 
         cmd = SHT40_CMD_MEAS_HIGH_PREC;
 
-        /* Fire measurement command; i2c_transfer7 returns void in some libopencm3 versions,
-         * so we can't rely on a return value across builds. Call it and proceed.
-         */
-        i2c_transfer7(SHT40_I2C, SHT40_ADDR, &cmd, 1, NULL, 0);
+        /* Send measurement command via low-level write */
+        char i2c_err[64] = {0};
+        int wres = i2c_write_bytes(SHT40_I2C, SHT40_ADDR, &cmd, 1, I2C_FLAG_TIMEOUT_MS, i2c_err, sizeof(i2c_err));
+        if (wres != 0) {
+            if (usb_configured) {
+                char msg[128];
+                snprintf(msg, sizeof(msg), "SHT40 write err %d (%s) try%u\r\n", wres, i2c_err, (unsigned)(attempt + 1));
+                usb_write_str(msg);
+            }
+            i2c1_soft_reset(SHT40_I2C);
+            i2c_setup();
+            bus_reinit_count++;
+            delay_ms(2);
+            continue;
+        }
 
         uint32_t tstart = millis();
         uint32_t read_attempts = 0;
         uint32_t crc_fail_count = 0;
 
         while ((millis() - tstart) < SHT40_MEAS_DELAY_MS) {
-            /* Clear buffer before read so stale bytes don't falsely pass CRC */
             memset(buf, 0, sizeof(buf));
-
-            i2c_transfer7(SHT40_I2C, SHT40_ADDR, NULL, 0, buf, sizeof(buf));
+            int rres = i2c_read_bytes(SHT40_I2C, SHT40_ADDR, buf, sizeof(buf),
+                                      I2C_BYTE_TIMEOUT_MS, i2c_err, sizeof(i2c_err));
             read_attempts++;
 
-            /* Only validate CRC and decode if buffer looks non-zero; we still rely on CRC */
-            if ((sht40_crc8(&buf[0], 2) == buf[2]) &&
-                (sht40_crc8(&buf[3], 2) == buf[5])) {
+            if (rres == 0) {
+                if ((sht40_crc8(&buf[0], 2) == buf[2]) &&
+                    (sht40_crc8(&buf[3], 2) == buf[5])) {
 
-                uint16_t t_raw = (uint16_t)((buf[0] << 8) | buf[1]);
+                    uint16_t t_raw = (uint16_t)((buf[0] << 8) | buf[1]);
 
-                /* T(°C) = -45 + 175 * t_raw / 65535
-                 * T(m°C) = ((21875 * t_raw) >> 13) - 45000
-                 */
-                int32_t t_milli = ((21875 * (int32_t)t_raw) >> 13) - 45000;
+                    /* T(°C) = -45 + 175 * t_raw / 65535
+                     * T(m°C) = ((21875 * t_raw) >> 13) - 45000
+                     */
+                    int32_t t_milli = ((21875 * (int32_t)t_raw) >> 13) - 45000;
 
-                if (t_milli >= 0) *temp_centi = (t_milli + 5) / 10;
-                else              *temp_centi = (t_milli - 5) / 10;
+                    if (t_milli >= 0) *temp_centi = (t_milli + 5) / 10;
+                    else              *temp_centi = (t_milli - 5) / 10;
 
-                return true;
+                    return true;
+                }
+                crc_fail_count++;
+            } else {
+                /* failed read -> count as failure; log later */
+                crc_fail_count++;
+                if (usb_configured) {
+                    char msg[128];
+                    snprintf(msg, sizeof(msg), "SHT40 read err %d (%s) try%u\r\n", rres, i2c_err, (unsigned)(attempt + 1));
+                    usb_write_str(msg);
+                }
             }
 
-            crc_fail_count++;
             delay_ms(SHT40_I2C_RETRY_DELAY_MS);
         }
 
         if (usb_configured) {
             char msg[128];
-            snprintf(msg, sizeof(msg), "SHT40 TO %lums crc%lu readAttempts%lu try%u\r\n",
+            snprintf(msg, sizeof(msg), "SHT40 TO %lums crc%lu readAttempt%lu try%u\r\n",
                      (unsigned long)SHT40_MEAS_DELAY_MS,
                      (unsigned long)crc_fail_count,
                      (unsigned long)read_attempts,
