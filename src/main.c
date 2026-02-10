@@ -28,9 +28,7 @@
 #include <libopencm3/stm32/gpio.h>
 #include <libopencm3/stm32/iwdg.h>
 
-/* Heater pin (PB0) */
-#define HEATER_PORT GPIOB
-#define HEATER_PIN  GPIO0
+#include "pinmap.h"
 
 /* Timing */
 #define CHECK_INTERVAL_MS   (30UL * 1000UL)

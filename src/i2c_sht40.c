@@ -14,6 +14,8 @@
 #include <libopencm3/stm32/gpio.h>
 #include <libopencm3/stm32/rcc.h>
 
+#include "pinmap.h"
+
 /* Ensure SHT40/I2C macros are present when this file is compiled standalone. */
 #ifndef SHT40_I2C_MAX_RETRIES
 #define SHT40_I2C_MAX_RETRIES           3U
@@ -29,8 +31,6 @@
 #endif
 
 /* Local definitions tuned for STM32F103 */
-#define SHT40_I2C               I2C1
-#define SHT40_ADDR              0x44
 #define SHT40_CMD_MEAS_HIGH_PREC 0xFD
 
 #define I2C_PCLK1_FREQ_MHZ      36U
@@ -171,11 +171,11 @@ rd_err_no_stop:
 
 void sht40_i2c_init(void)
 {
-    rcc_periph_clock_enable(RCC_I2C1);
-    rcc_periph_clock_enable(RCC_GPIOB);
-
-    gpio_set_mode(GPIOB, GPIO_MODE_OUTPUT_50_MHZ,
-                  GPIO_CNF_OUTPUT_ALTFN_OPENDRAIN, GPIO6 | GPIO7);
+    rcc_periph_clock_enable(SHT40_I2C_RCC);
+    rcc_periph_clock_enable(SHT40_GPIO_RCC);
+    
+    gpio_set_mode(SHT40_SCL_PORT, GPIO_MODE_OUTPUT_50_MHZ,
+		  GPIO_CNF_OUTPUT_ALTFN_OPENDRAIN, SHT40_SCL_PIN | SHT40_SDA_PIN);
 
     i2c_peripheral_disable(SHT40_I2C);
     I2C_CR1(SHT40_I2C) |= I2C_CR1_SWRST;
