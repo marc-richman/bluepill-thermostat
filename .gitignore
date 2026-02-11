@@ -3,3 +3,33 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+~*
+
+# Vim
+*.swp
+*.swo
+*~
+
+# Emacs
+*~
+\#*\#
+.\#*
+
+# ===== KiCad backups / autosave =====
+
+# Autosave files
+*_autosave-*.kicad_sch
+*_autosave-*.kicad_pcb
+
+# Backup files
+*.bak
+*-bak
+
+# KiCad temporary files
+*.tmp
+*.000
+*.001
+
+# Lock files
+*.lck
