@@ -19,3 +19,8 @@
 #define SHT40_GPIO_RCC RCC_GPIOB
 #define SHT40_I2C_RCC  RCC_I2C1
 
+
+/* -------- Optional extra fan output (free GPIO) -------- */
+/* Change this if you prefer a different pin */
+#define FAN2_PORT GPIOB
+#define FAN2_PIN  GPIO1

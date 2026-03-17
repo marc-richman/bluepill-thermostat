@@ -46,6 +46,9 @@ void sys_tick_handler(void)
 /* Simple heater control wrappers */
 static inline void heater_on(void)  { gpio_set(HEATER_PORT, HEATER_PIN); }
 static inline void heater_off(void) { gpio_clear(HEATER_PORT, HEATER_PIN); }
+/* Fan2 control wrappers */
+static inline void fan2_on(void)  { gpio_set(FAN2_PORT, FAN2_PIN); }
+static inline void fan2_off(void) { gpio_clear(FAN2_PORT, FAN2_PIN); }
 
 /* Clock + systick setup */
 static void clock_setup(void)
@@ -86,7 +89,13 @@ static void gpio_setup(void)
     gpio_set_mode(HEATER_PORT, GPIO_MODE_OUTPUT_2_MHZ,
                   GPIO_CNF_OUTPUT_PUSHPULL, HEATER_PIN);
     heater_off();
+
+    /* Fan2 pin (optional) */
+    gpio_set_mode(FAN2_PORT, GPIO_MODE_OUTPUT_2_MHZ,
+                  GPIO_CNF_OUTPUT_PUSHPULL, FAN2_PIN);
+    fan2_off();
 }
+
 
 /* Watchdog setup */
 static void watchdog_setup(void)
@@ -153,7 +162,11 @@ static void on_command(const char *cmd)
             snprintf(buf, sizeof(buf), "%lu", (unsigned long)(cfg.heat_max_time_ms / 1000UL));
             usb_console_write("  run       = "); usb_console_write(buf); usb_console_write(" s\r\n");
             snprintf(buf, sizeof(buf), "%lu", (unsigned long)(cfg.cooldown_sleep_ms / 1000UL));
-            usb_console_write("  sleep     = "); usb_console_write(buf); usb_console_write(" s\r\n\r\n");
+            usb_console_write("  sleep     = "); usb_console_write(buf); usb_console_write(" s\r\n");
+            snprintf(buf, sizeof(buf), "%lu", (unsigned long)cfg.fan2_interval_s);
+            usb_console_write("  fan2_int  = "); usb_console_write(buf); usb_console_write(" s\r\n");
+            snprintf(buf, sizeof(buf), "%lu", (unsigned long)cfg.fan2_duration_s);
+            usb_console_write("  fan2_dur  = "); usb_console_write(buf); usb_console_write(" s\r\n\r\n");
         }
 
         return;
@@ -197,6 +210,40 @@ static void on_command(const char *cmd)
         return;
     }
 
+    if (strncmp(cmd, "fan2_interval=", 14) == 0 || strncmp(cmd, "fi=", 3) == 0) {
+        const char *valstr = strchr(cmd, '='); if (valstr) valstr++;
+        uint32_t secs;
+        if (valstr && parse_uint_seconds(valstr, &secs) && secs > 0) {
+            if (secs != cfg.fan2_interval_s) {
+                cfg.fan2_interval_s = secs;
+                usb_console_write("OK: fan2 interval updated\r\n");
+                config_save(&cfg);
+            } else {
+                usb_console_write("No change: fan2 interval unchanged\r\n");
+            }
+        } else {
+            usb_console_write("ERR: bad fan2 interval value\r\n");
+        }
+        return;
+    }
+
+    if (strncmp(cmd, "fan2_duration=", 14) == 0 || strncmp(cmd, "fd=", 3) == 0) {
+        const char *valstr = strchr(cmd, '='); if (valstr) valstr++;
+        uint32_t secs;
+        if (valstr && parse_uint_seconds(valstr, &secs) && secs > 0) {
+            if (secs != cfg.fan2_duration_s) {
+                cfg.fan2_duration_s = secs;
+                usb_console_write("OK: fan2 duration updated\r\n");
+                config_save(&cfg);
+            } else {
+                usb_console_write("No change: fan2 duration unchanged\r\n");
+            }
+        } else {
+            usb_console_write("ERR: bad fan2 duration value\r\n");
+        }
+        return;
+    }
+
     if (strcmp(cmd, "status") == 0 || strcmp(cmd, "config") == 0) {
         char buf[64];
         usb_console_write("\r\nCurrent config:\r\n");
@@ -206,7 +253,11 @@ static void on_command(const char *cmd)
         snprintf(buf, sizeof(buf), "%lu", (unsigned long)(cfg.heat_max_time_ms / 1000UL));
         usb_console_write("  run       = "); usb_console_write(buf); usb_console_write(" s\r\n");
         snprintf(buf, sizeof(buf), "%lu", (unsigned long)(cfg.cooldown_sleep_ms / 1000UL));
-        usb_console_write("  sleep     = "); usb_console_write(buf); usb_console_write(" s\r\n\r\n");
+        usb_console_write("  sleep     = "); usb_console_write(buf); usb_console_write(" s\r\n");
+            snprintf(buf, sizeof(buf), "%lu", (unsigned long)cfg.fan2_interval_s);
+            usb_console_write("  fan2_int  = "); usb_console_write(buf); usb_console_write(" s\r\n");
+            snprintf(buf, sizeof(buf), "%lu", (unsigned long)cfg.fan2_duration_s);
+            usb_console_write("  fan2_dur  = "); usb_console_write(buf); usb_console_write(" s\r\n\r\n");
         return;
     }
 
@@ -216,6 +267,8 @@ static void on_command(const char *cmd)
     usb_console_write("  tC=<degC> / thresholdC=<degC>\r\n");
     usb_console_write("  run=<seconds> or r=<seconds>\r\n");
     usb_console_write("  sleep=<seconds> or s=<seconds>\r\n");
+    usb_console_write("  fan2_interval=<seconds> or fi=<seconds>\r\n");
+    usb_console_write("  fan2_duration=<seconds> or fd=<seconds>\r\n");
     usb_console_write("  status\r\n\r\n");
 }
 
@@ -273,6 +326,8 @@ int main(void)
     usb_console_write("  tC=<degC> / thresholdC=<degC>\r\n");
     usb_console_write("  run=<seconds> or r=<seconds>\r\n");
     usb_console_write("  sleep=<seconds> or s=<seconds>\r\n");
+    usb_console_write("  fan2_interval=<seconds> or fi=<seconds>\r\n");
+    usb_console_write("  fan2_duration=<seconds> or fd=<seconds>\r\n");
     usb_console_write("  status\r\n\r\n");
 
     /* Ensure heater is off */
@@ -282,6 +337,12 @@ int main(void)
     enum { IDLE = 0, HEATING, COOLDOWN } state = IDLE;
     uint32_t state_start_ms = system_millis;
     uint32_t last_verbose_ms = 0;
+    /* Fan2 state */
+    uint32_t fan2_last_ms = system_millis; /* last time fan2 completed or timer started */
+    bool fan2_active = false;
+    uint32_t fan2_on_start_ms = 0;
+    bool fan2_pending = false; /* interval elapsed while heater running */
+    bool heat_pending = false; /* temp called for heat while fan2 was running */
 
     while (1) {
         usb_console_poll();
@@ -302,10 +363,19 @@ int main(void)
                 while (1) { usb_console_poll(); }
             }
             if (want_heat) {
-                if (usb_console_configured()) usb_console_write("State: IDLE -> HEATING\r\n");
-                heater_on();
-                state = HEATING;
-                state_start_ms = system_millis;
+                if (fan2_active) {
+                    /* Fan2 and heater are mutually exclusive. Defer heat until fan2 stops. */
+                    heat_pending = true;
+                    if (usb_console_configured()) usb_console_write("Heat deferred: FAN2 active\r\n");
+                } else {
+                    heat_pending = false;
+                    if (usb_console_configured()) usb_console_write("State: IDLE -> HEATING\r\n");
+                    heater_on();
+                    state = HEATING;
+                    state_start_ms = system_millis;
+                }
+            } else {
+                heat_pending = false;
             }
             break;
 
@@ -345,6 +415,52 @@ int main(void)
         default:
             /* Fatal: stop feeding watchdog */
             while (1) { usb_console_poll(); }
+        }
+
+        /* --- Fan2 periodic control ---
+         * Behavior:
+         *  - Set FAN2_PIN high for cfg.fan2_duration_s seconds every
+         *    cfg.fan2_interval_s seconds.
+         *  - If the interval elapses while heater is running, defer
+         *    the fan until heater stops; when heater stops, immediately
+         *    run the fan for the configured duration and restart the
+         *    interval counter.
+         */
+        if (fan2_active) {
+            /* turn off after duration */
+            if ((system_millis - fan2_on_start_ms) >= (cfg.fan2_duration_s * 1000UL)) {
+                fan2_off();
+                fan2_active = false;
+                fan2_last_ms = system_millis; /* restart interval from now */
+
+                /* If heat was requested while FAN2 was active, allow heater to start on the next loop. */
+                if (heat_pending && usb_console_configured()) {
+                    usb_console_write("FAN2 done: heat may resume\r\n");
+                }
+            }
+        } else {
+            /* Not currently running */
+            if (fan2_pending && state != HEATING) {
+                /* heater stopped — run fan now */
+                fan2_on();
+                fan2_active = true;
+                fan2_on_start_ms = system_millis;
+                fan2_pending = false;
+            } else if (!fan2_pending) {
+                /* check interval expiry */
+                uint32_t interval_ms = cfg.fan2_interval_s * 1000UL;
+                if ((system_millis - fan2_last_ms) >= interval_ms) {
+                    if (state == HEATING) {
+                        /* defer until heater stops */
+                        fan2_pending = true;
+                    } else {
+                        /* start fan now */
+                        fan2_on();
+                        fan2_active = true;
+                        fan2_on_start_ms = system_millis;
+                    }
+                }
+            }
         }
 
         /* Sleep until next watchdog-legal sample; usb is polled inside */

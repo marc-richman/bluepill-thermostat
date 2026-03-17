@@ -8,6 +8,8 @@ static const config_data_t default_cfg = {
     .threshold_centi = 1670,
     .heat_max_time_ms = 300000,
     .cooldown_sleep_ms = 300000,
+    .fan2_interval_s = 3600,
+    .fan2_duration_s = 20,
 };
 
 void config_load(config_data_t *out)
@@ -26,7 +28,9 @@ int config_save(const config_data_t *in)
     if (old->magic == in->magic &&
         old->threshold_centi == in->threshold_centi &&
         old->heat_max_time_ms == in->heat_max_time_ms &&
-        old->cooldown_sleep_ms == in->cooldown_sleep_ms) {
+        old->cooldown_sleep_ms == in->cooldown_sleep_ms &&
+        old->fan2_interval_s == in->fan2_interval_s &&
+        old->fan2_duration_s == in->fan2_duration_s) {
         return 0; /* unchanged */
     }
 
