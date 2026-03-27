@@ -242,7 +242,7 @@ void usb_console_init(void)
 
 int usb_console_write(const char *s)
 {
-    if (!configured) return 0;
+    if (!s) return 0;
     int enqueued = 0;
     while (*s) {
         uint16_t next = (tx_head + 1) % USB_TX_BUF_SIZE;
