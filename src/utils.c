@@ -2,6 +2,12 @@
 #include <stdio.h>
 #include <stdint.h>
 
+static bool parse_trailing_space_only(const char *s)
+{
+    while (*s == ' ' || *s == '\t') s++;
+    return *s == '\0';
+}
+
 volatile uint32_t system_millis = 0; /* defined here; sys_tick_handler in main increments it */
 
 /* Format centi value like -12.34 or 56.78 */
@@ -53,13 +59,14 @@ bool parse_centi(const char *s, int32_t *out)
             fp_digits++;
             s++;
         }
-        while (*s >= '0' && *s <= '9') s++;
+        if (*s >= '0' && *s <= '9') return false;
     }
     if (fp_digits == 1) fp *= 10;
     if (fp_digits == 0) fp = 0;
     int32_t val = ip * 100 + fp;
     if (val > 100000) return false;
     if (neg) val = -val;
+    if (!parse_trailing_space_only(s)) return false;
     *out = val;
     return true;
 }
@@ -76,6 +83,7 @@ bool parse_uint_seconds(const char *s, uint32_t *out)
         if (val > 604800U) return false;
         s++;
     }
+    if (!parse_trailing_space_only(s)) return false;
     *out = val;
     return true;
 }

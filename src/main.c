@@ -115,6 +115,7 @@ static void delay_ms_poll_usb(uint32_t ms)
 
 /* Global configuration instance */
 static config_data_t cfg;
+static bool fan2_enabled = true;
 
 /* Command handler registered with usb_console: updates cfg and saves when needed */
 static void on_command(const char *cmd)
@@ -244,6 +245,27 @@ static void on_command(const char *cmd)
         return;
     }
 
+    if (strcmp(cmd, "fan enable") == 0) {
+        if (!fan2_enabled) {
+            fan2_enabled = true;
+            usb_console_write("OK: fan enabled\r\n");
+        } else {
+            usb_console_write("No change: fan already enabled\r\n");
+        }
+        return;
+    }
+
+    if (strcmp(cmd, "fan disable") == 0) {
+        if (fan2_enabled) {
+            fan2_enabled = false;
+            fan2_off();
+            usb_console_write("OK: fan disabled\r\n");
+        } else {
+            usb_console_write("No change: fan already disabled\r\n");
+        }
+        return;
+    }
+
     if (strcmp(cmd, "status") == 0 || strcmp(cmd, "config") == 0) {
         char buf[64];
         usb_console_write("\r\nCurrent config:\r\n");
@@ -258,6 +280,7 @@ static void on_command(const char *cmd)
             usb_console_write("  fan2_int  = "); usb_console_write(buf); usb_console_write(" s\r\n");
             snprintf(buf, sizeof(buf), "%lu", (unsigned long)cfg.fan2_duration_s);
             usb_console_write("  fan2_dur  = "); usb_console_write(buf); usb_console_write(" s\r\n\r\n");
+            usb_console_write("  fan       = "); usb_console_write(fan2_enabled ? "enabled\r\n\r\n" : "disabled\r\n\r\n");
         return;
     }
 
@@ -269,6 +292,7 @@ static void on_command(const char *cmd)
     usb_console_write("  sleep=<seconds> or s=<seconds>\r\n");
     usb_console_write("  fan2_interval=<seconds> or fi=<seconds>\r\n");
     usb_console_write("  fan2_duration=<seconds> or fd=<seconds>\r\n");
+    usb_console_write("  fan enable / fan disable\r\n");
     usb_console_write("  status\r\n\r\n");
 }
 
@@ -328,6 +352,7 @@ int main(void)
     usb_console_write("  sleep=<seconds> or s=<seconds>\r\n");
     usb_console_write("  fan2_interval=<seconds> or fi=<seconds>\r\n");
     usb_console_write("  fan2_duration=<seconds> or fd=<seconds>\r\n");
+    usb_console_write("  fan enable / fan disable\r\n");
     usb_console_write("  status\r\n\r\n");
 
     /* Ensure heater is off */
@@ -426,7 +451,15 @@ int main(void)
          *    run the fan for the configured duration and restart the
          *    interval counter.
          */
-        if (fan2_active) {
+        if (!fan2_enabled) {
+            if (fan2_active) {
+                fan2_off();
+                fan2_active = false;
+            }
+            fan2_pending = false;
+            heat_pending = false;
+            fan2_last_ms = system_millis;
+        } else if (fan2_active) {
             /* turn off after duration */
             if ((system_millis - fan2_on_start_ms) >= (cfg.fan2_duration_s * 1000UL)) {
                 fan2_off();
